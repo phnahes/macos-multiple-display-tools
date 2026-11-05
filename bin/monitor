@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+#
+# monitor — controla brilho, contraste e volume de monitores externos no macOS
+# via DDC/CI, e mostra em qual porta o monitor está conectado.
+#
+# O mesmo arquivo atende a quatro nomes (symlinks criados pelo install.sh):
+#   monitor, brilho, contraste, monitor-info
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+M1DDC_BIN="${M1DDC_BIN:-m1ddc}"
+MONITOR_NAME="${MONITOR_NAME:-ARZOPA}"
+MONITOR_ID="${MONITOR_ID:-}"
+MIN=0
+MAX=100
+
+die()  { printf 'monitor: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require_m1ddc() {
+  have "$M1DDC_BIN" || die "m1ddc não encontrado. Instale com: brew install m1ddc"
+}
+
+# ---------------------------------------------------------------------------
+# Resolução do monitor
+# ---------------------------------------------------------------------------
+
+display_list() { "$M1DDC_BIN" display list 2>/dev/null; }
+
+resolve_display() {
+  if [ -n "$MONITOR_ID" ]; then
+    printf '%s\n' "$MONITOR_ID"
+    return 0
+  fi
+
+  local list id
+  list="$(display_list)" || die "não consegui executar '$M1DDC_BIN display list'"
+  [ -n "$list" ] || die "nenhum display encontrado"
+
+  id="$(printf '%s\n' "$list" | awk -v name="$MONITOR_NAME" '
+    index(tolower($0), tolower(name)) && match($0, /^\[[0-9]+\]/) {
+      print substr($0, 2, RLENGTH - 2)
+      exit
+    }')"
+
+  if [ -z "$id" ]; then
+    # Se só existe um display (Mac mini, iMac sem monitor extra), usa ele.
+    if [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" -eq 1 ]; then
+      printf '%s\n' "$list" | sed -n 's/^\[\([0-9]*\)\].*/\1/p'
+      return 0
+    fi
+    printf 'monitor: nenhum display chamado "%s".\n\nDisplays encontrados:\n%s\n\nDefina MONITOR_NAME ou MONITOR_ID.\n' \
+      "$MONITOR_NAME" "$list" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$id"
+}
+
+# ---------------------------------------------------------------------------
+# Leitura e escrita DDC
+# ---------------------------------------------------------------------------
+
+get_value() {
+  local id="$1" feat="$2" raw
+  raw="$("$M1DDC_BIN" display "$id" get "$feat" 2>/dev/null)" || return 1
+  raw="$(printf '%s' "$raw" | tr -cd '0-9')"
+  [ -n "$raw" ] || return 1
+  printf '%s\n' "$raw"
+}
+
+set_value() {
+  local id="$1" feat="$2" value="$3"
+  "$M1DDC_BIN" display "$id" set "$feat" "$value" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+
+change() {
+  local feat="$1"
+  shift
+  require_m1ddc
+
+  local id cur arg n new
+  id="$(resolve_display)" || exit 1
+  cur="$(get_value "$id" "$feat")" ||
+    die "o monitor não respondeu a '$feat'. DDC/CI indisponível ou monitor desconectado."
+
+  arg="${1:-}"
+  case "$arg" in
+    ''|get)
+      printf '%s\n' "$cur"
+      return 0
+      ;;
+    max) new=$MAX ;;
+    min) new=$MIN ;;
+    +[0-9]*)
+      n="${arg#+}"; [ -z "${n//[0-9]/}" ] || die "valor inválido: $arg"
+      new=$(( cur + n ))
+      ;;
+    -[0-9]*)
+      n="${arg#-}"; [ -z "${n//[0-9]/}" ] || die "valor inválido: $arg"
+      new=$(( cur - n ))
+      ;;
+    [0-9]*)
+      [ -z "${arg//[0-9]/}" ] || die "valor inválido: $arg"
+      new=$arg
+      ;;
+    *)
+      die "valor inválido: $arg (use 0-100, +N, -N, max ou min)"
+      ;;
+  esac
+
+  if [ "$new" -lt "$MIN" ]; then new=$MIN; fi
+  if [ "$new" -gt "$MAX" ]; then new=$MAX; fi
+
+  set_value "$id" "$feat" "$new" || die "não consegui escrever '$feat' no monitor"
+  printf '%s\n' "$new"
+}
+
+# ---------------------------------------------------------------------------
+# Porta física
+# ---------------------------------------------------------------------------
+
+# Mapeia o número da porta USB-C para a posição física (esquerda/direita).
+# A numeração interna não segue a ordem visual, então lemos do ioreg.
+usbc_locations() {
+  ioreg -r -c AppleARMSPMIDevice -l -w0 2>/dev/null | awk '
+    function hex2dec(h,   i, c, v) {
+      v = 0; h = tolower(h)
+      for (i = 1; i <= length(h); i++) {
+        c = substr(h, i, 1)
+        v = v * 16 + index("0123456789abcdef", c) - 1
+      }
+      return v
+    }
+    function emit() {
+      if (loc != "" && num != "") print num " " loc
+    }
+    /\+-o hpm[0-9]+@/ {
+      emit()
+      num = ""; loc = ""
+      next
+    }
+    /"port-number"/ {
+      v = $0; sub(/.*</, "", v); sub(/>.*/, "", v)
+      gsub(/0/, "", v)
+      num = hex2dec(v)
+    }
+    /"port-location"/ {
+      v = $0; sub(/.*<"/, "", v); sub(/">.*/, "", v)
+      loc = v
+    }
+    END { emit() }'
+}
+
+# Descreve a porta do transporte ativo: "USB-C 2 (esquerda, traseira)" etc.
+port_label() {
+  local desc="$1" num where
+  case "$desc" in
+    Port-HDMI*) printf 'HDMI' ;;
+    Port-USB-C@*)
+      num="${desc#Port-USB-C@}"
+      num="${num%%/*}"
+      where="$(usbc_locations | awk -v n="$num" '$1 == n { print $2; exit }')"
+      case "$where" in
+        left-front) where="USB-C $num (esquerda, frontal)" ;;
+        left-rear)  where="USB-C $num (esquerda, traseira)" ;;
+        right)      where="USB-C $num (direita)" ;;
+        '')         where="USB-C $num" ;;
+        *)          where="USB-C $num ($where)" ;;
+      esac
+      printf '%s' "$where"
+      ;;
+    *)
+      printf '%s' "${desc%%/*}"
+      ;;
+  esac
+}
+
+# Imprime o link ativo: desc|taxa|lanes|produto
+active_link() {
+  ioreg -r -c IOPortTransportStateDisplayPort -l -w0 2>/dev/null | awk '
+    /\+-o DisplayPort/ {
+      emit(); desc = ""; act = ""; rate = ""; lanes = ""; prod = ""
+      next
+    }
+    /"TransportDescription"/ { v = $0; sub(/.*= "/, "", v); sub(/"$/, "", v); desc = v }
+    /"Active" = Yes/         { act = "yes" }
+    /"LinkRateDescription"/  { v = $0; sub(/.*= "/, "", v); sub(/"$/, "", v); rate = v }
+    /"LaneCount"/ && lanes == "" { v = $0; sub(/.*= /, "", v); lanes = v }
+    /"ProductName"/ && prod == "" { v = $0; sub(/.*= "/, "", v); sub(/"$/, "", v); prod = v }
+    function emit() {
+      if (act == "yes") print desc "|" rate "|" lanes "|" prod
+    }
+    END { emit() }'
+}
+
+show_info() {
+  local line desc rate lanes prod ok="não"
+
+  if have "$M1DDC_BIN"; then
+    printf 'Displays:\n'
+    display_list | sed 's/^/  /'
+    printf '\n'
+  else
+    printf 'm1ddc: não instalado (brew install m1ddc)\n\n'
+  fi
+
+  line="$(active_link | head -n 1)"
+  if [ -n "$line" ]; then
+    IFS='|' read -r desc rate lanes prod <<< "$line"
+    printf 'Monitor:  %s\n' "${prod:-desconhecido}"
+    printf 'Conexão: %s\n' "$(port_label "$desc")"
+    printf 'Link:    %s, %s lanes\n\n' "${rate:-?}" "${lanes:-?}"
+  else
+    printf 'Conexão: nenhum monitor externo ativo\n\n'
+  fi
+
+  if have "$M1DDC_BIN"; then
+    local id val
+    if id="$(resolve_display 2>/dev/null)"; then
+      for feat in luminance:brilho contrast:contraste volume:volume; do
+        if val="$(get_value "$id" "${feat%%:*}")"; then
+          ok="$val"
+        else
+          ok="—"
+        fi
+        printf '%s: %s\n' "$(printf '%s' "${feat##*:}" | awk '{ printf "%s", toupper(substr($0,1,1)) substr($0,2) }')" "$ok"
+      done
+    fi
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+monitor — controle de monitores externos no macOS (DDC/CI)
+
+Uso:
+  monitor brightness [valor | +N | -N | max | min get]
+  monitor contrast   [valor | +N | -N | max | min get]
+  monitor volume     [valor | +N | -N | max | min get]
+  monitor info
+  monitor list
+  monitor help
+
+Atalhos (symlinks):
+  brilho [valor | +N | -N]   mesmo que monitor brightness
+  contraste [...]            mesmo que monitor contrast
+  monitor-info               mesmo que monitor info
+
+Exemplos:
+  brilho           # imprime o brilho atual
+  brilho 60        # define 60%
+  brilho +10       # aumenta 10 pontos
+  brilho -10       # diminui 10 pontos
+  contraste 75
+  monitor info     # displays, porta física, link e valores atuais
+
+Variáveis de ambiente:
+  MONITOR_NAME  nome do monitor na lista do m1ddc (padrão: ARZOPA)
+  MONITOR_ID    índice fixo do display, ignora MONITOR_NAME
+  M1DDC_BIN     caminho do binário m1ddc (padrão: m1ddc no PATH)
+
+Saída numérica (0-100) para uso em scripts.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  if [ $# -gt 0 ]; then shift; fi
+
+  case "$cmd" in
+    brightness|brilho|luminance|lum) change luminance "$@" ;;
+    contrast|contraste)              change contrast "$@" ;;
+    volume|som)                      change volume "$@" ;;
+    info|status)                     show_info ;;
+    list|displays)                   require_m1ddc; display_list ;;
+    help|--help|-h)                  usage ;;
+    version|--version)               printf '%s\n' "$VERSION" ;;
+    *)                               usage; exit 1 ;;
+  esac
+}
+
+prog="$(basename -- "$0")"
+case "$prog" in
+  brilho)       main brightness "$@" ;;
+  contraste)    main contrast "$@" ;;
+  monitor-info) main info "$@" ;;
+  *)            main "$@" ;;
+esac
