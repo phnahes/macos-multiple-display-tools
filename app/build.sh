@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Compila o MonitorBar.app (Swift, sem Xcode) em app/build/MonitorBar.app.
-# Uso: ./app/build.sh [destino]
+# Builds MonitorBar.app (Swift, no Xcode) into app/build/MonitorBar.app.
+# Usage: ./app/build.sh [destination]
 #
 set -euo pipefail
 
@@ -9,7 +9,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${1:-$DIR/build/MonitorBar.app}"
 
 command -v swiftc >/dev/null 2>&1 || {
-  echo "erro: swiftc não encontrado. Instale as Command Line Tools: xcode-select --install" >&2
+  echo "error: swiftc not found. Install the Command Line Tools: xcode-select --install" >&2
   exit 1
 }
 
@@ -23,7 +23,7 @@ swiftc "$DIR/main.swift" \
 
 cp "$DIR/Info.plist" "$DEST/Contents/Info.plist"
 
-# Assinatura ad-hoc: suficiente para rodar localmente.
+# Ad-hoc signature: enough to run locally.
 codesign --force --sign - "$DEST" >/dev/null 2>&1 || true
 
 echo "$DEST"

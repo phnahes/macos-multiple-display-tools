@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Remove a CLI, o app e o LaunchAgent instalados pelo install.sh.
+# Removes the CLI, the app and the LaunchAgent installed by install.sh.
 #
 set -euo pipefail
 
@@ -15,8 +15,8 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 rm -f "$AGENT"
 rm -rf "$APP"
 
-# Remove apenas symlinks que apontam para este repositório.
-for name in monitor brilho contraste monitor-info; do
+# Remove only symlinks that point back to this repository.
+for name in monitor brightness contrast monitor-info brilho contraste; do
   link="$BIN_DIR/$name"
   if [ -L "$link" ]; then
     target="$(readlink "$link")"
@@ -26,4 +26,4 @@ for name in monitor brilho contraste monitor-info; do
   fi
 done
 
-echo "monitor-tools removido."
+echo "monitor-tools uninstalled."

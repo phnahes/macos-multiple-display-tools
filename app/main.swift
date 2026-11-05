@@ -1,17 +1,17 @@
 //
-//  MonitorBar — mantém o brilho de um monitor externo (DDC/CI) em sincronia
-//  com o brilho do display integrado do Mac, com controle na barra de menu.
+//  MonitorBar — keeps an external monitor's brightness (DDC/CI) in sync with
+//  the Mac's built-in display, with controls in the menu bar.
 //
-//  O brilho do display interno é lido/escrito pela API privada DisplayServices
-//  (a mesma que o Control Center usa). O monitor externo é controlado pelo
-//  binário m1ddc (brew install m1ddc).
+//  The built-in display brightness is read/written through Apple's private
+//  DisplayServices API (the same one Control Center uses). The external monitor
+//  is driven by the m1ddc binary (brew install m1ddc).
 //
 import AppKit
 import CoreGraphics
 import IOKit
 import IOKit.hid
 
-// MARK: - DisplayServices (framework privado da Apple)
+// MARK: - DisplayServices (Apple private framework)
 
 private typealias GetBrightnessFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
 private typealias SetBrightnessFn = @convention(c) (CGDirectDisplayID, Float) -> Int32
@@ -99,7 +99,7 @@ final class DDC {
         run(["display", "list"]).output
     }
 
-    /// Índice do display cujo nome contém `name` (ou MONITOR_ID, se definido).
+    /// Index of the display whose name contains `name` (or MONITOR_ID, if set).
     func resolveIndex(name: String) -> String? {
         if let forced = ProcessInfo.processInfo.environment["MONITOR_ID"], !forced.isEmpty {
             return forced
@@ -124,11 +124,11 @@ final class DDC {
     }
 }
 
-// MARK: - Sensor de ângulo da tampa
+// MARK: - Lid angle sensor
 //
-// O MacBook tem um sensor Hall no hinge, exposto como HID (usage page 0x20,
-// usage 0x8A, report feature 1). Os dois primeiros bytes, little-endian, são
-// o ângulo em graus.
+// MacBooks have a Hall sensor in the hinge, exposed as HID (usage page 0x20,
+// usage 0x8A, feature report 1). The first two bytes, little-endian, are the
+// angle in degrees.
 
 final class LidAngle {
     private let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -197,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { defaults.set(newValue, forKey: "showAngleInBar") }
     }
 
-    // MARK: ciclo de vida
+    // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         defaults.register(defaults: ["syncEnabled": true, "showAngleInBar": false])
@@ -216,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Brilho do monitor")
+            let image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Monitor brightness")
             image?.isTemplate = true
             button.image = image
             button.image?.size = NSSize(width: 18, height: 18)
@@ -227,7 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        internalItem = NSMenuItem(title: "Brilho do Mac: —", action: nil, keyEquivalent: "")
+        internalItem = NSMenuItem(title: "Mac brightness: —", action: nil, keyEquivalent: "")
         internalItem.isEnabled = false
         menu.addItem(internalItem)
 
@@ -242,12 +242,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        syncItem = NSMenuItem(title: "Seguir o brilho do Mac", action: #selector(toggleSync), keyEquivalent: "")
+        syncItem = NSMenuItem(title: "Follow Mac brightness", action: #selector(toggleSync), keyEquivalent: "")
         syncItem.target = self
         syncItem.state = syncing ? .on : .off
         menu.addItem(syncItem)
 
-        let syncNow = NSMenuItem(title: "Sincronizar agora", action: #selector(syncNow), keyEquivalent: "")
+        let syncNow = NSMenuItem(title: "Sync now", action: #selector(syncNow), keyEquivalent: "")
         syncNow.target = self
         menu.addItem(syncNow)
 
@@ -257,55 +257,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitorItem.isEnabled = false
         menu.addItem(monitorItem)
 
-        angleItem = NSMenuItem(title: "Tampa: —", action: nil, keyEquivalent: "")
+        angleItem = NSMenuItem(title: "Lid: —", action: nil, keyEquivalent: "")
         angleItem.isEnabled = false
         menu.addItem(angleItem)
 
-        angleBarItem = NSMenuItem(title: "Mostrar ângulo na barra", action: #selector(toggleAngleInBar), keyEquivalent: "")
+        angleBarItem = NSMenuItem(title: "Show angle in menu bar", action: #selector(toggleAngleInBar), keyEquivalent: "")
         angleBarItem.target = self
         angleBarItem.state = showAngleInBar ? .on : .off
         menu.addItem(angleBarItem)
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Sair", action: #selector(quit), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
         statusItem.menu = menu
     }
 
-    // MARK: laço de sincronização
+    // MARK: sync loop
 
     private func tick() {
         updateAngle()
 
         guard let display = builtinDisplay(), let value = services.brightness(of: display) else {
-            internalItem.title = "Brilho do Mac: indisponível"
+            internalItem.title = "Mac brightness: unavailable"
             return
         }
 
         let percent = Int((value * 100).rounded())
-        internalItem.title = "Brilho do Mac: \(percent)%"
+        internalItem.title = "Mac brightness: \(percent)%"
         if syncing { slider.doubleValue = Double(percent) }
 
-        if debug { NSLog("MonitorBar: interno=%d%% tampa=%d°", percent, lastAngle ?? -1) }
+        if debug { NSLog("MonitorBar: internal=%d%% lid=%d°", percent, lastAngle ?? -1) }
 
         guard syncing else { return }
         if let last = lastApplied, abs(last - percent) < 1 { return }
         scheduleApply(percent)
     }
 
-    /// Atualiza o ângulo da tampa (sensor Hall do hinge, via HID).
+    /// Updates the lid angle (hinge Hall sensor, via HID).
     private func updateAngle() {
         guard let angle = lid.read() else {
-            if angleItem.title != "Tampa: sensor indisponível" {
-                angleItem.title = "Tampa: sensor indisponível"
+            if angleItem.title != "Lid: sensor unavailable" {
+                angleItem.title = "Lid: sensor unavailable"
             }
             return
         }
         lastAngle = angle
-        let text = "Tampa: \(angle)°"
+        let text = "Lid: \(angle)°"
         if angleItem.title != text { angleItem.title = text }
 
         guard showAngleInBar else { return }
@@ -314,9 +314,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Espera o brilho parar de mudar antes de escrever no monitor: durante um
-    /// ajuste com F1/F2 o valor interno muda várias vezes por segundo, e um
-    /// write DDC por passo satura o barramento.
+    /// Waits for the brightness to stop changing before writing to the monitor:
+    /// an F1/F2 ramp changes the internal value several times per second, and one
+    /// DDC write per step saturates the bus.
     private func scheduleApply(_ percent: Int) {
         pendingWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.apply(percent) }
@@ -330,7 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let index = resolveDisplayIfNeeded() else {
-            monitorItem.title = "Monitor: não encontrado"
+            monitorItem.title = "Monitor: not found"
             return
         }
 
@@ -369,7 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ids.prefix(Int(count)).first { CGDisplayIsBuiltin($0) != 0 }
     }
 
-    // MARK: ações
+    // MARK: actions
 
     @objc private func sliderChanged(_ sender: NSSlider) {
         let percent = Int(sender.doubleValue.rounded())
@@ -416,21 +416,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !syncing, let index = resolveDisplayIfNeeded(), let value = ddc.luminance(display: index) {
             slider.doubleValue = Double(value)
         }
-        monitorItem.title = displayIndex.map { "Monitor: \(monitorName) (\($0))" } ?? "Monitor: não encontrado"
+        monitorItem.title = displayIndex.map { "Monitor: \(monitorName) (\($0))" } ?? "Monitor: not found"
         if !services.available {
-            internalItem.title = "Brilho do Mac: API indisponível"
+            internalItem.title = "Mac brightness: API unavailable"
         }
         if !ddc.available {
-            monitorItem.title = "m1ddc não encontrado (brew install m1ddc)"
+            monitorItem.title = "m1ddc not found (brew install m1ddc)"
             syncItem.isEnabled = false
         }
     }
 }
 
-// MARK: - utilitário
+// MARK: - utilities
 
 extension DDC {
-    /// Executa em background e devolve o status na main queue.
+    /// Runs in the background and reports the status back on the main queue.
     func run(_ arguments: [String], completion: @escaping (Int32) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let status = self?.run(arguments).status ?? -1

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Instala o monitor-tools:
-#   - symlinks da CLI em ~/.local/bin (monitor, brilho, contraste, monitor-info)
-#   - MonitorBar.app em ~/Applications
-#   - LaunchAgent para abrir o MonitorBar no login
+# Installs monitor-tools:
+#   - CLI symlinks in ~/.local/bin (monitor, brightness, contrast, monitor-info)
+#   - MonitorBar.app in ~/Applications
+#   - LaunchAgent to start MonitorBar at login
 #
 set -euo pipefail
 
@@ -16,28 +16,28 @@ APP="$APPS_DIR/MonitorBar.app"
 
 say() { printf '%s\n' "$*"; }
 
-# --- dependências -----------------------------------------------------------
+# --- dependencies -----------------------------------------------------------
 if ! command -v m1ddc >/dev/null 2>&1; then
-  say "aviso: m1ddc não encontrado. A CLI e o MonitorBar precisam dele:"
-  say "       brew install m1ddc"
+  say "warning: m1ddc not found. The CLI and MonitorBar need it:"
+  say "         brew install m1ddc"
 fi
 
 # --- CLI --------------------------------------------------------------------
 mkdir -p "$BIN_DIR"
-for name in monitor brilho contraste monitor-info; do
+for name in monitor brightness contrast monitor-info brilho contraste; do
   ln -sf "$DIR/bin/monitor" "$BIN_DIR/$name"
 done
-say "CLI instalada em $BIN_DIR"
+say "CLI installed in $BIN_DIR"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) say "adicione ao PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+  *) say "add it to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
 # --- app --------------------------------------------------------------------
 mkdir -p "$APPS_DIR"
 "$DIR/app/build.sh" "$APP" >/dev/null
-say "app instalado em $APP"
+say "app installed at $APP"
 
 # --- LaunchAgent ------------------------------------------------------------
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
@@ -67,8 +67,8 @@ PLIST
 pkill -f "MonitorBar.app/Contents/MacOS/MonitorBar" 2>/dev/null || true
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$AGENT"
-say "MonitorBar carregado no login"
+say "MonitorBar loaded at login"
 
 say ""
-say "Pronto. Procure o ícone de sol na barra de menu."
-say "Para desinstalar: $DIR/uninstall.sh"
+say "Done. Look for the sun icon in the menu bar."
+say "To uninstall: $DIR/uninstall.sh"
