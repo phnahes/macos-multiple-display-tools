@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Installs monitor-tools:
+# Installs macos-multiple-display-tools:
 #   - CLI symlinks in ~/.local/bin (monitor, brightness, contrast, monitor-info)
 #   - MonitorBar.app in ~/Applications
 #   - LaunchAgent to start MonitorBar at login

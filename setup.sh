@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One-shot setup for monitor-tools.
+# One-shot setup for macos-multiple-display-tools.
 #
 # Checks and installs, in order:
 #   1. macOS / Apple Silicon sanity check
@@ -30,7 +30,7 @@ confirm() {
 
 usage() {
   cat <<'EOF'
-setup.sh — prepare everything monitor-tools needs and install it
+setup.sh — prepare everything macos-multiple-display-tools needs and install it
 
 Usage:
   ./setup.sh [-y|--yes]
@@ -110,7 +110,7 @@ else
 fi
 
 # --- 5. install -------------------------------------------------------------
-step "[5/5] Installing monitor-tools"
+step "[5/5] Installing macos-multiple-display-tools"
 "$DIR/install.sh"
 
 say ""

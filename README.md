@@ -1,4 +1,4 @@
-# monitor-tools
+# macos-multiple-display-tools
 
 Control an external monitor's brightness on macOS — and make it follow the Mac's
 built-in display — with a menu bar app and a CLI. The app also shows the opening
@@ -8,7 +8,7 @@ Built because macOS exposes no brightness control for third-party monitors, and
 F1/F2 only works on the built-in display (or on Apple displays).
 
 ```
-monitor-tools
+macos-multiple-display-tools
 ├── MonitorBar.app   menu bar app that keeps the brightness in sync
 └── monitor / brightness / contrast / monitor-info   DDC/CI CLI
 ```
@@ -39,8 +39,8 @@ monitor-tools
 ## One-shot setup
 
 ```bash
-git clone <this-repo> monitor-tools
-cd monitor-tools
+git clone <this-repo> macos-multiple-display-tools
+cd macos-multiple-display-tools
 ./setup.sh
 ```
 
@@ -60,8 +60,8 @@ rebuilds and reloads what is already there.
 ## Manual install
 
 ```bash
-git clone <this-repo> monitor-tools
-cd monitor-tools
+git clone <this-repo> macos-multiple-display-tools
+cd macos-multiple-display-tools
 ./install.sh
 ```
 

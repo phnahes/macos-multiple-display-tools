@@ -16,14 +16,19 @@ rm -f "$AGENT"
 rm -rf "$APP"
 
 # Remove only symlinks that point back to this repository.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/monitor"
 for name in monitor brightness contrast monitor-info brilho contraste; do
   link="$BIN_DIR/$name"
-  if [ -L "$link" ]; then
-    target="$(readlink "$link")"
-    case "$target" in
-      */monitor-tools/bin/monitor) rm -f "$link" ;;
-    esac
+  [ -L "$link" ] || continue
+  if [ "$link" -ef "$SELF" ]; then
+    rm -f "$link"
+    continue
   fi
+  # Dangling symlink left behind if the repository moved.
+  target="$(readlink "$link")"
+  case "$target" in
+    */bin/monitor) [ -e "$target" ] || rm -f "$link" ;;
+  esac
 done
 
-echo "monitor-tools uninstalled."
+echo "macos-multiple-display-tools uninstalled."
