@@ -39,7 +39,7 @@ macos-multiple-display-tools
 ## One-shot setup
 
 ```bash
-git clone <this-repo> macos-multiple-display-tools
+git clone https://github.com/phnahes/macos-multiple-display-tools.git
 cd macos-multiple-display-tools
 ./setup.sh
 ```
@@ -60,7 +60,7 @@ rebuilds and reloads what is already there.
 ## Manual install
 
 ```bash
-git clone <this-repo> macos-multiple-display-tools
+git clone https://github.com/phnahes/macos-multiple-display-tools.git
 cd macos-multiple-display-tools
 ./install.sh
 ```
