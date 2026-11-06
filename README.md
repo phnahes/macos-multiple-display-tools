@@ -105,13 +105,19 @@ if [ "$(brightness)" -lt 30 ]; then brightness 30; fi
 
 ## MonitorBar (menu bar)
 
-Sun icon in the menu bar. The menu has:
+Sun icon in the menu bar. The menu adapts to the sync state:
 
-- **Mac brightness: X%** — current built-in display value
-- **slider** — with sync on, moves the Mac's brightness (the external monitor
-  follows); with sync off, drives the external monitor directly
+**Sync on** — one slider, `Mac brightness`, that moves the built-in display and
+makes the external monitor follow.
+
+**Sync off** — one slider per connected display (`Built-in display`, `ARZOPA`,
+...), each controlling only its own brightness. Displays that don't answer a DDC
+read get no slider.
+
+The rest of the menu:
+
 - **Follow Mac brightness** — turns sync on/off (persisted)
-- **Sync now** — forces a sync
+- **Sync now** — forces a sync (only enabled with sync on)
 - **Monitor: ARZOPA (2)** — display in use
 - **Lid: 112°** — lid opening angle, live
 - **Show angle in menu bar** — shows the angle next to the icon (persisted)
@@ -122,6 +128,7 @@ including automatic ambient-light changes. Just use the Mac normally.
 Implementation details:
 
 - reads the internal brightness every 0.4 s;
+- rebuilds the menu on every open, so the display list and values are current;
 - waits 150 ms for stability before writing (an F1/F2 ramp changes the value
   several times per second, and one write per step saturates the DDC bus);
 - only writes when the difference is ≥ 1%;

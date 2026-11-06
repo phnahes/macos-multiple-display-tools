@@ -51,6 +51,11 @@ final class DisplayServices {
 
 // MARK: - m1ddc
 
+struct DisplayEntry {
+    let index: String
+    let name: String
+}
+
 final class DDC {
     private let path: String?
 
@@ -99,18 +104,26 @@ final class DDC {
         run(["display", "list"]).output
     }
 
+    /// Parses m1ddc's list: "[2] ARZOPA (7EC3C4DC-...)".
+    func displays() -> [DisplayEntry] {
+        displayList().split(separator: "\n").compactMap { line in
+            guard let open = line.firstIndex(of: "["),
+                  let close = line.firstIndex(of: "]") else { return nil }
+            let index = String(line[line.index(after: open)..<close])
+            var name = String(line[line.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+            if let paren = name.range(of: " (", options: .backwards) {
+                name = String(name[..<paren.lowerBound])
+            }
+            return DisplayEntry(index: index, name: name.isEmpty ? "Display \(index)" : name)
+        }
+    }
+
     /// Index of the display whose name contains `name` (or MONITOR_ID, if set).
     func resolveIndex(name: String) -> String? {
         if let forced = ProcessInfo.processInfo.environment["MONITOR_ID"], !forced.isEmpty {
             return forced
         }
-        for line in displayList().split(separator: "\n") {
-            guard line.lowercased().contains(name.lowercased()),
-                  let open = line.firstIndex(of: "["),
-                  let close = line.firstIndex(of: "]") else { continue }
-            return String(line[line.index(after: open)..<close])
-        }
-        return nil
+        return displays().first { $0.name.lowercased().contains(name.lowercased()) }?.index
     }
 
     func setLuminance(_ percent: Int, display index: String) -> Bool {
@@ -160,6 +173,52 @@ final class LidAngle {
     }
 }
 
+// MARK: - Menu row (label + slider)
+
+final class BrightnessRow: NSObject {
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 30))
+    let label = NSTextField(labelWithString: "")
+    let slider = NSSlider()
+    let title: String
+    var onChange: ((Int) -> Void)?
+
+    init(title: String, value: Int) {
+        self.title = title
+        super.init()
+
+        label.frame = NSRect(x: 14, y: 7, width: 110, height: 17)
+        label.font = .systemFont(ofSize: 12)
+        label.lineBreakMode = .byTruncatingTail
+        label.textColor = .labelColor
+
+        slider.frame = NSRect(x: 128, y: 5, width: 138, height: 20)
+        slider.minValue = 0
+        slider.maxValue = 100
+        slider.controlSize = .small
+        slider.target = self
+        slider.action = #selector(changed(_:))
+
+        container.addSubview(label)
+        container.addSubview(slider)
+        setValue(value)
+    }
+
+    @objc private func changed(_ sender: NSSlider) {
+        let value = Int(sender.doubleValue.rounded())
+        updateLabel(value)
+        onChange?(value)
+    }
+
+    func setValue(_ value: Int) {
+        slider.doubleValue = Double(value)
+        updateLabel(value)
+    }
+
+    private func updateLabel(_ value: Int) {
+        label.stringValue = "\(title) \(value)%"
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -172,13 +231,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
-    private var syncItem: NSMenuItem!
-    private var monitorItem: NSMenuItem!
-    private var internalItem: NSMenuItem!
-    private var angleItem: NSMenuItem!
-    private var angleBarItem: NSMenuItem!
-    private var slider: NSSlider!
-    private var lastAngle: Int?
+    private var syncItem: NSMenuItem?
+    private var syncNowItem: NSMenuItem?
+    private var monitorItem: NSMenuItem?
+    private var angleItem: NSMenuItem?
+    private var angleBarItem: NSMenuItem?
+
+    private var rows: [BrightnessRow] = []
+    private var builtinRow: BrightnessRow?
 
     private var displayIndex: String?
     private var lastResolve = Date.distantPast
@@ -186,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var applying = false
     private var pending: Int?
     private var pendingWork: DispatchWorkItem?
+    private var lastAngle: Int?
 
     private var syncing: Bool {
         get { defaults.bool(forKey: "syncEnabled") }
@@ -202,7 +263,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         defaults.register(defaults: ["syncEnabled": true, "showAngleInBar": false])
         NSApp.setActivationPolicy(.accessory)
-        buildMenu()
+        buildStatusItem()
+        rebuildMenu()
         startTimer()
         tick()
     }
@@ -213,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.timer = timer
     }
 
-    private func buildMenu() {
+    private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             let image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Monitor brightness")
@@ -226,45 +288,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu()
         menu.delegate = self
+        statusItem.menu = menu
+    }
 
-        internalItem = NSMenuItem(title: "Mac brightness: —", action: nil, keyEquivalent: "")
-        internalItem.isEnabled = false
-        menu.addItem(internalItem)
+    // MARK: menu
 
-        let sliderItem = NSMenuItem()
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 32))
-        slider = NSSlider(value: 100, minValue: 0, maxValue: 100, target: self, action: #selector(sliderChanged(_:)))
-        slider.frame = NSRect(x: 14, y: 6, width: 192, height: 20)
-        slider.controlSize = .small
-        container.addSubview(slider)
-        sliderItem.view = container
-        menu.addItem(sliderItem)
+    /// Rebuilt on every open: with sync on there is a single slider (the Mac's
+    /// brightness, which the external monitor follows); with sync off there is
+    /// one slider per connected display.
+    private func rebuildMenu() {
+        guard let menu = statusItem.menu else { return }
+        menu.removeAllItems()
+        rows.removeAll()
+        builtinRow = nil
+
+        let builtin = services.available ? builtinDisplay() : nil
+        let hasBuiltin = builtin != nil
+        let builtinValue = builtin
+            .flatMap { services.brightness(of: $0) }
+            .map { Int(($0 * 100).rounded()) } ?? 0
+        let syncActive = syncing && hasBuiltin
+
+        if !services.available {
+            let item = NSMenuItem(title: "Mac brightness: API unavailable", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
+        if syncActive {
+            let row = BrightnessRow(title: "Mac brightness", value: builtinValue)
+            row.onChange = { [weak self] value in
+                self?.setBuiltinBrightness(value, pushToMonitor: true)
+            }
+            add(row, to: menu)
+            builtinRow = row
+        } else {
+            if hasBuiltin {
+                let row = BrightnessRow(title: "Built-in display", value: builtinValue)
+                row.onChange = { [weak self] value in
+                    self?.setBuiltinBrightness(value, pushToMonitor: false)
+                }
+                add(row, to: menu)
+                builtinRow = row
+            }
+
+            for entry in ddc.displays() {
+                // Displays that do not answer a DDC read (the built-in panel, or
+                // a monitor without DDC) get no slider.
+                guard let value = ddc.luminance(display: entry.index) else { continue }
+                let row = BrightnessRow(title: entry.name, value: value)
+                row.onChange = { [weak self] value in
+                    guard let self else { return }
+                    self.lastApplied = value
+                    _ = self.ddc.setLuminance(value, display: entry.index)
+                    if self.displayIndex == nil { self.displayIndex = entry.index }
+                }
+                add(row, to: menu)
+            }
+
+            if rows.isEmpty {
+                let item = NSMenuItem(title: "No controllable displays", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
+        }
 
         menu.addItem(.separator())
 
         syncItem = NSMenuItem(title: "Follow Mac brightness", action: #selector(toggleSync), keyEquivalent: "")
-        syncItem.target = self
-        syncItem.state = syncing ? .on : .off
-        menu.addItem(syncItem)
+        syncItem?.target = self
+        syncItem?.state = syncActive ? .on : .off
+        syncItem?.isEnabled = hasBuiltin && ddc.available
+        if let syncItem { menu.addItem(syncItem) }
 
-        let syncNow = NSMenuItem(title: "Sync now", action: #selector(syncNow), keyEquivalent: "")
-        syncNow.target = self
-        menu.addItem(syncNow)
+        syncNowItem = NSMenuItem(title: "Sync now", action: #selector(syncNow), keyEquivalent: "")
+        syncNowItem?.target = self
+        syncNowItem?.isEnabled = syncActive
+        if let syncNowItem { menu.addItem(syncNowItem) }
 
         menu.addItem(.separator())
 
         monitorItem = NSMenuItem(title: "Monitor: —", action: nil, keyEquivalent: "")
-        monitorItem.isEnabled = false
-        menu.addItem(monitorItem)
+        monitorItem?.isEnabled = false
+        if let monitorItem { menu.addItem(monitorItem) }
+        updateMonitorItem()
 
-        angleItem = NSMenuItem(title: "Lid: —", action: nil, keyEquivalent: "")
-        angleItem.isEnabled = false
-        menu.addItem(angleItem)
+        angleItem = NSMenuItem(title: lastAngle.map { "Lid: \($0)°" } ?? "Lid: —", action: nil, keyEquivalent: "")
+        angleItem?.isEnabled = false
+        if let angleItem { menu.addItem(angleItem) }
 
         angleBarItem = NSMenuItem(title: "Show angle in menu bar", action: #selector(toggleAngleInBar), keyEquivalent: "")
-        angleBarItem.target = self
-        angleBarItem.state = showAngleInBar ? .on : .off
-        menu.addItem(angleBarItem)
+        angleBarItem?.target = self
+        angleBarItem?.state = showAngleInBar ? .on : .off
+        if let angleBarItem { menu.addItem(angleBarItem) }
 
         menu.addItem(.separator())
 
@@ -272,7 +388,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quit.target = self
         menu.addItem(quit)
 
-        statusItem.menu = menu
+        if debug { NSLog("MonitorBar: menu rebuilt, rows=%d sync=%d", rows.count, syncActive ? 1 : 0) }
+    }
+
+    private func add(_ row: BrightnessRow, to menu: NSMenu) {
+        let item = NSMenuItem()
+        item.view = row.container
+        menu.addItem(item)
+        rows.append(row)
+    }
+
+    private func updateMonitorItem() {
+        guard let monitorItem else { return }
+        if !ddc.available {
+            monitorItem.title = "m1ddc not found (brew install m1ddc)"
+            return
+        }
+        if let index = displayIndex ?? resolveDisplayIfNeeded(force: true) {
+            monitorItem.title = "Monitor: \(monitorName) (\(index))"
+        } else {
+            monitorItem.title = "Monitor: not found"
+        }
     }
 
     // MARK: sync loop
@@ -281,13 +417,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateAngle()
 
         guard let display = builtinDisplay(), let value = services.brightness(of: display) else {
-            internalItem.title = "Mac brightness: unavailable"
             return
         }
 
         let percent = Int((value * 100).rounded())
-        internalItem.title = "Mac brightness: \(percent)%"
-        if syncing { slider.doubleValue = Double(percent) }
+        builtinRow?.setValue(percent)
 
         if debug { NSLog("MonitorBar: internal=%d%% lid=%d°", percent, lastAngle ?? -1) }
 
@@ -299,14 +433,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Updates the lid angle (hinge Hall sensor, via HID).
     private func updateAngle() {
         guard let angle = lid.read() else {
-            if angleItem.title != "Lid: sensor unavailable" {
-                angleItem.title = "Lid: sensor unavailable"
+            if angleItem?.title != "Lid: sensor unavailable" {
+                angleItem?.title = "Lid: sensor unavailable"
             }
             return
         }
         lastAngle = angle
         let text = "Lid: \(angle)°"
-        if angleItem.title != text { angleItem.title = text }
+        if angleItem?.title != text { angleItem?.title = text }
 
         guard showAngleInBar else { return }
         if statusItem.button?.title != "\(angle)°" {
@@ -330,7 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let index = resolveDisplayIfNeeded() else {
-            monitorItem.title = "Monitor: not found"
+            monitorItem?.title = "Monitor: not found"
             return
         }
 
@@ -340,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.applying = false
             if status == 0 {
                 self.lastApplied = percent
-                self.monitorItem.title = "Monitor: \(self.monitorName) (\(index))"
+                self.monitorItem?.title = "Monitor: \(self.monitorName) (\(index))"
             } else {
                 self.displayIndex = nil
                 self.lastApplied = nil
@@ -354,9 +488,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func resolveDisplayIfNeeded() -> String? {
+    private func resolveDisplayIfNeeded(force: Bool = false) -> String? {
         if let index = displayIndex { return index }
-        guard Date().timeIntervalSince(lastResolve) > 5 else { return nil }
+        guard force || Date().timeIntervalSince(lastResolve) > 5 else { return nil }
         lastResolve = Date()
         displayIndex = ddc.resolveIndex(name: monitorName)
         return displayIndex
@@ -371,30 +505,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: actions
 
-    @objc private func sliderChanged(_ sender: NSSlider) {
-        let percent = Int(sender.doubleValue.rounded())
-        if syncing, let display = builtinDisplay() {
-            services.setBrightness(Float(percent) / 100, of: display)
-            lastApplied = nil
-            apply(percent)
-        } else if let index = resolveDisplayIfNeeded() {
-            lastApplied = percent
-            _ = ddc.setLuminance(percent, display: index)
+    private func setBuiltinBrightness(_ value: Int, pushToMonitor: Bool) {
+        guard let display = builtinDisplay() else { return }
+        services.setBrightness(Float(value) / 100, of: display)
+        if pushToMonitor {
+            apply(value)
         }
     }
 
     @objc private func toggleSync() {
+        guard builtinDisplay() != nil else { return }
         syncing.toggle()
-        syncItem.state = syncing ? .on : .off
-        if syncing {
-            lastApplied = nil
-            tick()
-        }
+        syncItem?.state = syncing ? .on : .off
+        syncNowItem?.isEnabled = syncing
+        lastApplied = nil
+        if syncing { tick() }
     }
 
     @objc private func toggleAngleInBar() {
         showAngleInBar.toggle()
-        angleBarItem.state = showAngleInBar ? .on : .off
+        angleBarItem?.state = showAngleInBar ? .on : .off
         if !showAngleInBar { statusItem.button?.title = "" }
         updateAngle()
     }
@@ -412,18 +542,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: NSMenuDelegate
 
-    func menuWillOpen(_ menu: NSMenu) {
-        if !syncing, let index = resolveDisplayIfNeeded(), let value = ddc.luminance(display: index) {
-            slider.doubleValue = Double(value)
-        }
-        monitorItem.title = displayIndex.map { "Monitor: \(monitorName) (\($0))" } ?? "Monitor: not found"
-        if !services.available {
-            internalItem.title = "Mac brightness: API unavailable"
-        }
-        if !ddc.available {
-            monitorItem.title = "m1ddc not found (brew install m1ddc)"
-            syncItem.isEnabled = false
-        }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
     }
 }
 
