@@ -31,4 +31,9 @@ for name in monitor brightness contrast monitor-info brilho contraste; do
   esac
 done
 
+# The lidangle helper is copied, not symlinked.
+if [ -f "$BIN_DIR/lidangle" ] && [ ! -L "$BIN_DIR/lidangle" ]; then
+  rm -f "$BIN_DIR/lidangle"
+fi
+
 echo "macos-multiple-display-tools uninstalled."

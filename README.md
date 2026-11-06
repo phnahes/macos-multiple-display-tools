@@ -1,5 +1,7 @@
 # macos-multiple-display-tools
 
+[![CI](https://github.com/phnahes/macos-multiple-display-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/phnahes/macos-multiple-display-tools/actions/workflows/ci.yml)
+
 Control an external monitor's brightness on macOS — and make it follow the Mac's
 built-in display — with a menu bar app and a CLI. The app also shows the opening
 angle of your MacBook lid.
@@ -10,7 +12,7 @@ F1/F2 only works on the built-in display (or on Apple displays).
 ```
 macos-multiple-display-tools
 ├── MonitorBar.app   menu bar app that keeps the brightness in sync
-└── monitor / brightness / contrast / monitor-info   DDC/CI CLI
+└── monitor / brightness / contrast / monitor-info / lidangle   CLI
 ```
 
 ## How it works
@@ -26,6 +28,9 @@ macos-multiple-display-tools
   mapped to the actual port position (`port-location` on the `hpm` nodes).
 - **Lid angle:** Hall sensor in the hinge, exposed as HID (`usage page 0x20`,
   `usage 0x8A`, feature report 1). The first two bytes are the angle in degrees.
+- **Serialized bus:** the app and the CLI share a lock
+  (`~/Library/Caches/MonitorBar/ddc.lock`), so only one DDC transaction runs at a
+  time. Concurrent access is what makes `m1ddc` crash.
 
 ## Requirements
 
@@ -70,7 +75,8 @@ cd macos-multiple-display-tools
 1. create symlinks in `~/.local/bin` (`monitor`, `brightness`, `contrast`,
    `monitor-info`, plus the `brilho`/`contraste` aliases);
 2. build and install `MonitorBar.app` in `~/Applications`;
-3. register a LaunchAgent (`com.paulonahes.monitorbar`) to start it at login.
+3. install the `lidangle` helper binary in `~/.local/bin`;
+4. register a LaunchAgent (`com.paulonahes.monitorbar`) to start it at login.
 
 If `~/.local/bin` is not in your `PATH`, the script tells you. To uninstall:
 
@@ -89,6 +95,7 @@ brightness max         # 100
 
 contrast 75
 monitor volume 40
+monitor angle          # MacBook lid angle in degrees
 monitor info           # displays, physical port, link and current values
 monitor list           # displays as seen by m1ddc
 ```
@@ -142,17 +149,23 @@ The rest of the menu:
 - **Monitor: ARZOPA (2)** — display in use
 - **Lid: 112°** — lid opening angle, live
 - **Show angle in menu bar** — shows the angle next to the icon (persisted)
+- **Start at login** — enables/disables the LaunchAgent (persisted)
+- **Last error: ...** — only shown when a DDC write fails, with the time
 
 With sync on, **F1/F2 and Control Center control both monitors at once**,
 including automatic ambient-light changes. Just use the Mac normally.
 
 Implementation details:
 
-- reads the internal brightness every 0.4 s;
-- rebuilds the menu on every open, so the display list and values are current;
+- reads the internal brightness every 0.4 s, but only while there is something
+  live to follow (sync on, or the angle shown in the menu bar);
+- rebuilds the menu from a cache and refreshes it in the background, so opening
+  the menu never waits on `m1ddc`;
 - waits 150 ms for stability before writing (an F1/F2 ramp changes the value
   several times per second, and one write per step saturates the DDC bus);
 - only writes when the difference is ≥ 1%;
+- retries DDC operations twice and serializes them with the CLI through a lock;
+- reacts to hot-plug and wake through system notifications;
 - reads the lid angle on the same interval, straight from the sensor's feature
   report.
 
@@ -224,16 +237,40 @@ Run `monitor list` and adjust `MONITOR_NAME`, or pass the index:
 
 **The display disappears from the m1ddc list**
 Unplug and replug the cable. The index can change — MonitorBar re-resolves it
-every 5 s.
+automatically when displays change.
 
 **DDC does not respond**
 Try a cable straight into the Mac's USB-C/HDMI port, without a hub. Confirm the
-monitor accepts DDC (some require enabling it in the OSD).
+monitor accepts DDC (some require enabling it in the OSD). The menu shows the
+last failure time under "Last error".
 
 **The icon does not appear in the menu bar**
 `pgrep -fl MonitorBar` to check it is running, and
 `launchctl print gui/$(id -u)/com.paulonahes.monitorbar` for the agent state.
 Logs in `~/Library/Logs/MonitorBar.log`.
+
+## Development
+
+```bash
+./tests/run.sh       # CLI suite, uses fake m1ddc/ioreg, no hardware
+./app/build.sh       # builds the app + lidangle helper
+shellcheck bin/monitor setup.sh install.sh uninstall.sh app/build.sh tests/*.sh
+```
+
+The test suite covers argument parsing, clamping, per-feature state, error paths,
+`monitor info` and the symlink shorthands. CI runs it on macOS and lints the
+shell scripts on Linux.
+
+### Releases
+
+Push a tag and GitHub Actions builds and publishes the app bundle:
+
+```bash
+git tag -a v1.1.0 -m "v1.1.0"
+git push origin v1.1.0
+```
+
+The release contains `MonitorBar-<tag>-macos.zip` and its SHA-256 checksum.
 
 ## Tested on
 
@@ -246,13 +283,17 @@ It works with other monitors; `MONITOR_NAME` is what changes.
 ## Layout
 
 ```
-bin/monitor      CLI (one script, several names)
-app/main.swift   menu bar app
-app/Info.plist   bundle (LSUIElement)
-app/build.sh     builds with swiftc, no Xcode
-setup.sh         one-shot setup (dependencies + install.sh)
-install.sh       CLI + app + LaunchAgent
-uninstall.sh     removes everything
+bin/monitor        CLI (one script, several names)
+app/main.swift     menu bar app
+app/lidangle.swift lid angle helper (CLI)
+app/Info.plist     bundle (LSUIElement)
+app/build.sh       builds with swiftc, no Xcode
+tests/run.sh       CLI test suite (fake m1ddc/ioreg)
+.github/workflows  CI and release
+setup.sh           one-shot setup (dependencies + install.sh)
+install.sh         CLI + app + LaunchAgent
+uninstall.sh       removes everything
+CHANGELOG.md       release notes
 ```
 
 ## License

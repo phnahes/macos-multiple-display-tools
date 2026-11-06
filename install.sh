@@ -39,6 +39,10 @@ mkdir -p "$APPS_DIR"
 "$DIR/app/build.sh" "$APP" >/dev/null
 say "app installed at $APP"
 
+# Helper CLI for the lid angle (compiled by build.sh).
+install -m 755 "$DIR/app/build/lidangle" "$BIN_DIR/lidangle"
+say "lidangle installed in $BIN_DIR"
+
 # --- LaunchAgent ------------------------------------------------------------
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 cat > "$AGENT" <<PLIST

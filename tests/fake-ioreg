@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Minimal ioreg stand-in for the test suite: one USB-C display port and the
+# matching HPM port-location entry.
+#
+set -uo pipefail
+
+case "$*" in
+  *AppleARMSPMIDevice*)
+    cat <<'EOF'
++-o hpm0@C  <class AppleARMSPMIDevice, id 0x1, registered, matched, active, busy 0, retain 8>
+  | {
+  |   "port-location" = <"left-rear">
+  |   "port-number" = <02000000>
+  | }
+EOF
+    ;;
+  *IOPortTransportStateDisplayPort*)
+    cat <<'EOF'
++-o DisplayPort  <class IOPortTransportStateDisplayPort, id 0x2, registered, matched, active, busy 0, retain 11>
+      {
+        "TransportDescription" = "Port-USB-C@2/DisplayPort"
+        "Active" = Yes
+        "LinkRateDescription" = "2.7 Gbps (HBR)"
+        "LaneCount" = 4
+        "ProductName" = "Fake Monitor"
+      }
+EOF
+    ;;
+esac

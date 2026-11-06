@@ -8,6 +8,7 @@
 //
 import AppKit
 import CoreGraphics
+import Darwin
 import IOKit
 import IOKit.hid
 
@@ -49,6 +50,37 @@ final class DisplayServices {
     }
 }
 
+// MARK: - DDC bus lock
+//
+// One DDC transaction at a time per user. The CLI (bin/monitor) uses the same
+// directory lock, so the app and a script cannot talk to the monitor at the same
+// time — concurrent access is what makes m1ddc crash.
+
+final class DDCLock {
+    private static let lockPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Caches/MonitorBar/ddc.lock")
+
+    static func acquire() -> Bool {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: lockPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for _ in 0..<80 {
+            do {
+                try fm.createDirectory(at: lockPath, withIntermediateDirectories: false)
+                return true
+            } catch {
+                usleep(50_000)
+            }
+        }
+        // Probably a leftover lock from a crashed process.
+        try? fm.removeItem(at: lockPath)
+        return (try? fm.createDirectory(at: lockPath, withIntermediateDirectories: false)) != nil
+    }
+
+    static func release() {
+        try? FileManager.default.removeItem(at: lockPath)
+    }
+}
+
 // MARK: - m1ddc
 
 struct DisplayEntry {
@@ -84,6 +116,9 @@ final class DDC {
     @discardableResult
     func run(_ arguments: [String]) -> (status: Int32, output: String) {
         guard let path else { return (-1, "") }
+        let locked = DDCLock.acquire()
+        defer { if locked { DDCLock.release() } }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -126,14 +161,23 @@ final class DDC {
         return displays().first { $0.name.lowercased().contains(name.lowercased()) }?.index
     }
 
+    /// Retries once: DDC reads occasionally fail right after a write.
     func setLuminance(_ percent: Int, display index: String) -> Bool {
-        run(["display", index, "set", "luminance", String(percent)]).status == 0
+        for attempt in 0..<2 {
+            if run(["display", index, "set", "luminance", String(percent)]).status == 0 { return true }
+            if attempt == 0 { usleep(100_000) }
+        }
+        return false
     }
 
     func luminance(display index: String) -> Int? {
-        let output = run(["display", index, "get", "luminance"]).output
-        let digits = output.filter(\.isNumber)
-        return digits.isEmpty ? nil : Int(digits)
+        for attempt in 0..<2 {
+            let output = run(["display", index, "get", "luminance"]).output
+            let digits = output.filter(\.isNumber)
+            if let value = Int(digits) { return value }
+            if attempt == 0 { usleep(100_000) }
+        }
+        return nil
     }
 }
 
@@ -180,10 +224,12 @@ final class BrightnessRow: NSObject {
     let label = NSTextField(labelWithString: "")
     let slider = NSSlider()
     let title: String
+    let ddcIndex: String?
     var onChange: ((Int) -> Void)?
 
-    init(title: String, value: Int) {
+    init(title: String, value: Int, ddcIndex: String? = nil) {
         self.title = title
+        self.ddcIndex = ddcIndex
         super.init()
 
         label.frame = NSRect(x: 14, y: 7, width: 110, height: 17)
@@ -222,12 +268,19 @@ final class BrightnessRow: NSObject {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct DisplayCache {
+        var entries: [DisplayEntry] = []
+        var values: [String: Int] = [:]
+        var fetched = false
+    }
+
     private let services = DisplayServices.shared
     private let ddc = DDC()
     private let lid = LidAngle()
     private let monitorName = ProcessInfo.processInfo.environment["MONITOR_NAME"] ?? "ARZOPA"
     private let debug = ProcessInfo.processInfo.environment["MONITORBAR_DEBUG"] == "1"
     private let defaults = UserDefaults.standard
+    private let agentLabel = "com.paulonahes.monitorbar"
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -236,9 +289,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitorItem: NSMenuItem?
     private var angleItem: NSMenuItem?
     private var angleBarItem: NSMenuItem?
+    private var loginItem: NSMenuItem?
 
     private var rows: [BrightnessRow] = []
     private var builtinRow: BrightnessRow?
+    private var cache = DisplayCache()
 
     private var displayIndex: String?
     private var lastResolve = Date.distantPast
@@ -247,6 +302,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pending: Int?
     private var pendingWork: DispatchWorkItem?
     private var lastAngle: Int?
+    private var lastError: String?
+    private var refreshing = false
+    private var sleeping = false
+    private var applyBackoff = Date.distantPast
+
+    private var loginEnabled = false
+    private var loginAvailable = false
 
     private var syncing: Bool {
         get { defaults.bool(forKey: "syncEnabled") }
@@ -264,15 +326,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.register(defaults: ["syncEnabled": true, "showAngleInBar": false])
         NSApp.setActivationPolicy(.accessory)
         buildStatusItem()
+        observeSystemChanges()
         rebuildMenu()
-        startTimer()
+        refreshLoginState()
+        updateTimerState()
         tick()
-    }
-
-    private func startTimer() {
-        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+        refreshDisplays()
     }
 
     private func buildStatusItem() {
@@ -291,7 +350,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
+    private func observeSystemChanges() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(systemChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(systemChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
+    }
+
+    // MARK: polling policy
+
+    /// Polls only when there is something live to follow: sync on, or the angle
+    /// shown in the menu bar. Otherwise the menu reads the values when it opens.
+    private func updateTimerState() {
+        let needed = (syncing && builtinDisplay() != nil) || showAngleInBar
+        if needed { startTimer() } else { stopTimer() }
+    }
+
+    private func startTimer() {
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
     // MARK: menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if ddc.available && !cache.fetched { refreshDisplaysSync() }
+        rebuildMenu()
+        refreshDisplays()
+    }
 
     /// Rebuilt on every open: with sync on there is a single slider (the Mac's
     /// brightness, which the external monitor follows); with sync off there is
@@ -332,16 +428,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 builtinRow = row
             }
 
-            for entry in ddc.displays() {
-                // Displays that do not answer a DDC read (the built-in panel, or
-                // a monitor without DDC) get no slider.
-                guard let value = ddc.luminance(display: entry.index) else { continue }
-                let row = BrightnessRow(title: entry.name, value: value)
+            for entry in cache.entries {
+                guard let value = cache.values[entry.index] else { continue }
+                let row = BrightnessRow(title: entry.name, value: value, ddcIndex: entry.index)
                 row.onChange = { [weak self] value in
                     guard let self else { return }
                     self.lastApplied = value
-                    _ = self.ddc.setLuminance(value, display: entry.index)
-                    if self.displayIndex == nil { self.displayIndex = entry.index }
+                    if !self.ddc.setLuminance(value, display: entry.index) {
+                        self.setError("DDC write failed at \(self.timestamp())")
+                    }
                 }
                 add(row, to: menu)
             }
@@ -382,13 +477,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         angleBarItem?.state = showAngleInBar ? .on : .off
         if let angleBarItem { menu.addItem(angleBarItem) }
 
+        loginItem = NSMenuItem(title: "Start at login", action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem?.target = self
+        loginItem?.state = loginEnabled ? .on : .off
+        loginItem?.isEnabled = loginAvailable
+        if let loginItem { menu.addItem(loginItem) }
+
+        if let lastError {
+            let item = NSMenuItem(title: "Last error: \(lastError)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
-        if debug { NSLog("MonitorBar: menu rebuilt, rows=%d sync=%d", rows.count, syncActive ? 1 : 0) }
+        updateAngle()
+        if debug {
+            NSLog("MonitorBar: menu rebuilt, rows=%d sync=%d", rows.count, syncActive ? 1 : 0)
+        }
     }
 
     private func add(_ row: BrightnessRow, to menu: NSMenu) {
@@ -404,16 +514,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             monitorItem.title = "m1ddc not found (brew install m1ddc)"
             return
         }
-        if let index = displayIndex ?? resolveDisplayIfNeeded(force: true) {
+        if let index = displayIndex {
             monitorItem.title = "Monitor: \(monitorName) (\(index))"
         } else {
             monitorItem.title = "Monitor: not found"
         }
     }
 
+    // MARK: display cache (keeps the menu snappy)
+
+    private func refreshDisplaysSync() {
+        guard ddc.available else { return }
+        let entries = ddc.displays()
+        var values: [String: Int] = [:]
+        for entry in entries {
+            if let value = ddc.luminance(display: entry.index) { values[entry.index] = value }
+        }
+        cache = DisplayCache(entries: entries, values: values, fetched: true)
+        adoptDisplayIndex(from: entries)
+    }
+
+    private func refreshDisplays() {
+        guard ddc.available, !refreshing else { return }
+        refreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let entries = self.ddc.displays()
+            var values: [String: Int] = [:]
+            for entry in entries {
+                if let value = self.ddc.luminance(display: entry.index) { values[entry.index] = value }
+            }
+            DispatchQueue.main.async {
+                self.refreshing = false
+                self.cache = DisplayCache(entries: entries, values: values, fetched: true)
+                self.adoptDisplayIndex(from: entries)
+                self.applyCacheToMenu()
+            }
+        }
+    }
+
+    private func adoptDisplayIndex(from entries: [DisplayEntry]) {
+        if let match = entries.first(where: { $0.name.lowercased().contains(monitorName.lowercased()) }) {
+            displayIndex = match.index
+        }
+        updateMonitorItem()
+    }
+
+    private func applyCacheToMenu() {
+        for row in rows {
+            guard let index = row.ddcIndex, let value = cache.values[index] else { continue }
+            row.setValue(value)
+        }
+    }
+
     // MARK: sync loop
 
     private func tick() {
+        guard !sleeping else { return }
         updateAngle()
 
         guard let display = builtinDisplay(), let value = services.brightness(of: display) else {
@@ -427,6 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard syncing else { return }
         if let last = lastApplied, abs(last - percent) < 1 { return }
+        guard Date() >= applyBackoff else { return }
         scheduleApply(percent)
     }
 
@@ -459,11 +617,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func apply(_ percent: Int) {
+        guard !sleeping else { return }
         if applying {
             pending = percent
             return
         }
         guard let index = resolveDisplayIfNeeded() else {
+            // Back off: the display may be unplugged or asleep. Hot-plug, wake
+            // and "Sync now" reset this immediately.
+            applyBackoff = Date().addingTimeInterval(10)
+            setError("monitor not found at \(timestamp())")
             monitorItem?.title = "Monitor: not found"
             return
         }
@@ -474,10 +637,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.applying = false
             if status == 0 {
                 self.lastApplied = percent
+                self.lastError = nil
+                self.applyBackoff = .distantPast
                 self.monitorItem?.title = "Monitor: \(self.monitorName) (\(index))"
             } else {
                 self.displayIndex = nil
                 self.lastApplied = nil
+                self.setError("DDC write failed at \(self.timestamp())")
             }
             if let next = self.pending, next != percent {
                 self.pending = nil
@@ -488,10 +654,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func resolveDisplayIfNeeded(force: Bool = false) -> String? {
+    private func resolveDisplayIfNeeded() -> String? {
         if let index = displayIndex { return index }
-        guard force || Date().timeIntervalSince(lastResolve) > 5 else { return nil }
+        guard Date().timeIntervalSince(lastResolve) > 5 else { return nil }
         lastResolve = Date()
+        if let match = cache.entries.first(where: { $0.name.lowercased().contains(monitorName.lowercased()) }) {
+            displayIndex = match.index
+            return displayIndex
+        }
         displayIndex = ddc.resolveIndex(name: monitorName)
         return displayIndex
     }
@@ -519,6 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncItem?.state = syncing ? .on : .off
         syncNowItem?.isEnabled = syncing
         lastApplied = nil
+        updateTimerState()
         if syncing { tick() }
     }
 
@@ -527,23 +698,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         angleBarItem?.state = showAngleInBar ? .on : .off
         if !showAngleInBar { statusItem.button?.title = "" }
         updateAngle()
+        updateTimerState()
+    }
+
+    @objc private func toggleLogin() {
+        guard loginAvailable else { return }
+        loginEnabled.toggle()
+        loginItem?.state = loginEnabled ? .on : .off
+        _ = runTool("/bin/launchctl", [loginEnabled ? "enable" : "disable", "gui/\(getuid())/\(agentLabel)"])
     }
 
     @objc private func syncNow() {
         lastApplied = nil
         displayIndex = nil
         lastResolve = .distantPast
+        applyBackoff = .distantPast
         tick()
+    }
+
+    @objc private func systemWillSleep() {
+        sleeping = true
+    }
+
+    @objc private func systemChanged() {
+        sleeping = false
+        displayIndex = nil
+        lastResolve = .distantPast
+        lastApplied = nil
+        applyBackoff = .distantPast
+        cache = DisplayCache()
+        updateTimerState()
+        tick()
+        refreshDisplays()
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    // MARK: NSMenuDelegate
+    // MARK: login item
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        rebuildMenu()
+    private var agentPlistPath: String {
+        NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
+    }
+
+    private func refreshLoginState() {
+        loginAvailable = FileManager.default.fileExists(atPath: agentPlistPath)
+        guard loginAvailable else {
+            loginEnabled = false
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let output = self.runTool("/bin/launchctl", ["print-disabled", "gui/\(getuid())"]) ?? ""
+            var enabled = true
+            for line in output.split(separator: "\n") where line.contains(self.agentLabel) {
+                enabled = !line.contains("=> disabled")
+            }
+            DispatchQueue.main.async {
+                self.loginEnabled = enabled
+                self.loginItem?.state = enabled ? .on : .off
+                self.loginItem?.isEnabled = true
+            }
+        }
+    }
+
+    private func runTool(_ path: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: helpers
+
+    private func setError(_ message: String) {
+        if lastError != message { NSLog("MonitorBar: %@", message) }
+        lastError = message
+    }
+
+    private func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: Date())
     }
 }
 

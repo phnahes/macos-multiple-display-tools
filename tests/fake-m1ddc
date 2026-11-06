@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# Minimal m1ddc stand-in for the test suite.
+# Syntax mirrored from m1ddc:
+#   m1ddc display list
+#   m1ddc display <index> get <feature>
+#   m1ddc display <index> set <feature> <value>
+# State is kept in $FAKE_STATE, one file per feature.
+#
+set -uo pipefail
+
+state="${FAKE_STATE:?FAKE_STATE is not set}"
+cmd="${1:-}"
+shift || true
+
+fail_builtin() {
+  echo "Could not find a suitable external display." >&2
+  exit 1
+}
+
+case "$cmd" in
+  display)
+    target="${1:-}"
+    shift || true
+    case "$target" in
+      list)
+        printf '%s\n' "${FAKE_LIST:-[1] Unknown Display (0000)
+[2] Test Monitor (1111)}"
+        ;;
+      *)
+        action="${1:-}"
+        shift || true
+        [ "$target" = "1" ] && fail_builtin
+        case "$action" in
+          get)
+            feature="${1:-}"
+            file="$state/$feature"
+            [ -f "$file" ] || printf '50\n' > "$file"
+            cat "$file"
+            ;;
+          set)
+            feature="${1:-}"
+            value="${2:-}"
+            printf '%s\n' "$value" > "$state/$feature"
+            printf 'Writing %s\n' "$value"
+            ;;
+          *)
+            echo "unknown action: $action" >&2
+            exit 1
+            ;;
+        esac
+        ;;
+    esac
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    exit 1
+    ;;
+esac

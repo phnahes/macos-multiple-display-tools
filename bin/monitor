@@ -9,13 +9,16 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 M1DDC_BIN="${M1DDC_BIN:-m1ddc}"
 MONITOR_NAME="${MONITOR_NAME:-ARZOPA}"
 MONITOR_ID="${MONITOR_ID:-}"
 MIN=0
 MAX=100
+
+# Shared with MonitorBar.app: one DDC transaction at a time per user.
+DDC_LOCK="$HOME/Library/Caches/MonitorBar/ddc.lock"
 
 die()  { printf 'monitor: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -25,10 +28,44 @@ require_m1ddc() {
 }
 
 # ---------------------------------------------------------------------------
+# DDC bus serialization
+# ---------------------------------------------------------------------------
+
+lock_acquire() {
+  local tries=0
+  mkdir -p "${DDC_LOCK%/*}" 2>/dev/null || true
+  while ! mkdir "$DDC_LOCK" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 80 ]; then
+      # A crashed process left the lock behind.
+      rmdir "$DDC_LOCK" 2>/dev/null || true
+      tries=0
+    fi
+    sleep 0.05
+  done
+}
+
+lock_release() { rmdir "$DDC_LOCK" 2>/dev/null || true; }
+
+# Runs m1ddc under the lock and prints its stdout.
+m1ddc_call() {
+  local out status=0
+  lock_acquire
+  out="$("$M1DDC_BIN" "$@" 2>/dev/null)" || status=$?
+  lock_release
+  printf '%s' "$out"
+  return "$status"
+}
+
+# ---------------------------------------------------------------------------
 # Display resolution
 # ---------------------------------------------------------------------------
 
-display_list() { "$M1DDC_BIN" display list 2>/dev/null; }
+display_list() { m1ddc_call display list; }
+
+display_indices() {
+  printf '%s\n' "$1" | sed -n 's/^\[\([0-9]*\)\].*/\1/p'
+}
 
 resolve_display() {
   if [ -n "$MONITOR_ID" ]; then
@@ -36,7 +73,7 @@ resolve_display() {
     return 0
   fi
 
-  local list id
+  local list id count candidate i
   list="$(display_list)" || die "could not run '$M1DDC_BIN display list'"
   [ -n "$list" ] || die "no displays found"
 
@@ -45,19 +82,34 @@ resolve_display() {
       print substr($0, 2, RLENGTH - 2)
       exit
     }')"
+  if [ -n "$id" ]; then
+    printf '%s\n' "$id"
+    return 0
+  fi
 
-  if [ -z "$id" ]; then
-    # If there is only one display (Mac mini, iMac with no extra monitor), use it.
-    if [ "$(printf '%s\n' "$list" | wc -l | tr -d ' ')" -eq 1 ]; then
-      printf '%s\n' "$list" | sed -n 's/^\[\([0-9]*\)\].*/\1/p'
-      return 0
+  # No name match: use the only display that answers DDC, if exactly one does.
+  count=0
+  candidate=""
+  for i in $(display_indices "$list"); do
+    if get_value "$i" luminance >/dev/null 2>&1; then
+      count=$((count + 1))
+      candidate="$i"
     fi
-    printf 'monitor: no display named "%s".\n\nDisplays found:\n%s\n\nSet MONITOR_NAME or MONITOR_ID.\n' \
-      "$MONITOR_NAME" "$list" >&2
+  done
+
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  if [ "$count" -eq 0 ]; then
+    printf 'monitor: no external display answers DDC.\n\nDisplays found:\n%s\n\nIf a monitor is connected, check the cable, the hub and the monitor OSD.\n' \
+      "$list" >&2
     return 1
   fi
 
-  printf '%s\n' "$id"
+  printf 'monitor: no display named "%s".\n\nDisplays found:\n%s\n\nSet MONITOR_NAME or MONITOR_ID.\n' \
+    "$MONITOR_NAME" "$list" >&2
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -65,16 +117,31 @@ resolve_display() {
 # ---------------------------------------------------------------------------
 
 get_value() {
-  local id="$1" feat="$2" raw
-  raw="$("$M1DDC_BIN" display "$id" get "$feat" 2>/dev/null)" || return 1
-  raw="$(printf '%s' "$raw" | tr -cd '0-9')"
-  [ -n "$raw" ] || return 1
-  printf '%s\n' "$raw"
+  local id="$1" feat="$2" raw attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    if raw="$(m1ddc_call display "$id" get "$feat")"; then
+      raw="$(printf '%s' "$raw" | tr -cd '0-9')"
+      if [ -n "$raw" ]; then
+        printf '%s\n' "$raw"
+        return 0
+      fi
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
 }
 
 set_value() {
-  local id="$1" feat="$2" value="$3"
-  "$M1DDC_BIN" display "$id" set "$feat" "$value" >/dev/null 2>&1
+  local id="$1" feat="$2" value="$3" attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    if m1ddc_call display "$id" set "$feat" "$value" >/dev/null; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -121,6 +188,11 @@ change() {
 
   set_value "$id" "$feat" "$new" || die "could not write '$feat' to the monitor"
   printf '%s\n' "$new"
+}
+
+show_angle() {
+  have lidangle || die "lidangle helper not found. Re-run ./install.sh"
+  lidangle
 }
 
 # ---------------------------------------------------------------------------
@@ -244,6 +316,7 @@ Usage:
   monitor brightness [value | +N | -N | max | min | get]
   monitor contrast   [value | +N | -N | max | min | get]
   monitor volume     [value | +N | -N | max | min | get]
+  monitor angle
   monitor info
   monitor list
   monitor help
@@ -259,6 +332,7 @@ Examples:
   brightness +10    # increase by 10 points
   brightness -10    # decrease by 10 points
   contrast 75
+  monitor angle     # MacBook lid angle in degrees
   monitor info      # displays, physical port, link and current values
 
 Environment:
@@ -278,6 +352,7 @@ main() {
     brightness|brilho|luminance|lum) change luminance "$@" ;;
     contrast|contraste)              change contrast "$@" ;;
     volume|som)                      change volume "$@" ;;
+    angle|lid)                        show_angle ;;
     info|status)                     show_info ;;
     list|displays)                   require_m1ddc; display_list ;;
     help|--help|-h)                  usage ;;
