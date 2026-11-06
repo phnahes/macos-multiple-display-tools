@@ -36,7 +36,28 @@ monitor-tools
 - A monitor that supports DDC/CI (most desktop monitors do; cheap portable
   monitors sometimes don't)
 
-## Install
+## One-shot setup
+
+```bash
+git clone <this-repo> monitor-tools
+cd monitor-tools
+./setup.sh
+```
+
+It checks and installs everything in order:
+
+| Step | What it does |
+|---|---|
+| 1 | checks macOS and CPU architecture |
+| 2 | installs the Command Line Tools if `swiftc` is missing (opens the macOS dialog) |
+| 3 | installs Homebrew if missing (asks first) |
+| 4 | installs `m1ddc` if missing |
+| 5 | runs `install.sh` (CLI symlinks, app build, LaunchAgent) |
+
+`./setup.sh -y` skips the prompts. It is idempotent: running it again only
+rebuilds and reloads what is already there.
+
+## Manual install
 
 ```bash
 git clone <this-repo> monitor-tools
@@ -229,6 +250,7 @@ bin/monitor      CLI (one script, several names)
 app/main.swift   menu bar app
 app/Info.plist   bundle (LSUIElement)
 app/build.sh     builds with swiftc, no Xcode
+setup.sh         one-shot setup (dependencies + install.sh)
 install.sh       CLI + app + LaunchAgent
 uninstall.sh     removes everything
 ```

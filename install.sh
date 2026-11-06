@@ -19,7 +19,7 @@ say() { printf '%s\n' "$*"; }
 # --- dependencies -----------------------------------------------------------
 if ! command -v m1ddc >/dev/null 2>&1; then
   say "warning: m1ddc not found. The CLI and MonitorBar need it:"
-  say "         brew install m1ddc"
+  say "         ./setup.sh installs it, or run: brew install m1ddc"
 fi
 
 # --- CLI --------------------------------------------------------------------
