@@ -153,12 +153,21 @@ final class DDC {
         }
     }
 
-    /// Index of the display whose name contains `name` (or MONITOR_ID, if set).
-    func resolveIndex(name: String) -> String? {
+    /// Resolves the display to control: MONITOR_ID, then a name match, then the
+    /// first display that answers DDC.
+    func resolveDisplay(name: String) -> DisplayEntry? {
         if let forced = ProcessInfo.processInfo.environment["MONITOR_ID"], !forced.isEmpty {
-            return forced
+            return DisplayEntry(index: forced, name: name.isEmpty ? "Display \(forced)" : name)
         }
-        return displays().first { $0.name.lowercased().contains(name.lowercased()) }?.index
+        let entries = displays()
+        if !name.isEmpty,
+           let match = entries.first(where: { $0.name.lowercased().contains(name.lowercased()) }) {
+            return match
+        }
+        for entry in entries where luminance(display: entry.index) != nil {
+            return entry
+        }
+        return nil
     }
 
     /// Retries once: DDC reads occasionally fail right after a write.
@@ -277,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let services = DisplayServices.shared
     private let ddc = DDC()
     private let lid = LidAngle()
-    private let monitorName = ProcessInfo.processInfo.environment["MONITOR_NAME"] ?? "ARZOPA"
+    private let monitorName = ProcessInfo.processInfo.environment["MONITOR_NAME"] ?? ""
     private let debug = ProcessInfo.processInfo.environment["MONITORBAR_DEBUG"] == "1"
     private let defaults = UserDefaults.standard
     private let agentLabel = "com.paulonahes.monitorbar"
@@ -296,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cache = DisplayCache()
 
     private var displayIndex: String?
+    private var displayLabel: String?
     private var lastResolve = Date.distantPast
     private var lastApplied: Int?
     private var applying = false
@@ -515,7 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if let index = displayIndex {
-            monitorItem.title = "Monitor: \(monitorName) (\(index))"
+            monitorItem.title = "Monitor: \(displayLabel ?? monitorName) (\(index))"
         } else {
             monitorItem.title = "Monitor: not found"
         }
@@ -554,8 +564,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func adoptDisplayIndex(from entries: [DisplayEntry]) {
-        if let match = entries.first(where: { $0.name.lowercased().contains(monitorName.lowercased()) }) {
+        let match: DisplayEntry?
+        if monitorName.isEmpty {
+            match = entries.first { cache.values[$0.index] != nil }
+        } else {
+            match = entries.first { $0.name.lowercased().contains(monitorName.lowercased()) }
+        }
+        if let match {
             displayIndex = match.index
+            displayLabel = match.name
         }
         updateMonitorItem()
     }
@@ -626,8 +643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Back off: the display may be unplugged or asleep. Hot-plug, wake
             // and "Sync now" reset this immediately.
             applyBackoff = Date().addingTimeInterval(10)
-            setError("monitor not found at \(timestamp())")
-            monitorItem?.title = "Monitor: not found"
+            let reason = cache.entries.contains { $0.name.lowercased() != "unknown display" }
+                ? "no DDC response"
+                : "monitor not found"
+            setError("\(reason) at \(timestamp())")
+            monitorItem?.title = "Monitor: \(reason)"
             return
         }
 
@@ -639,7 +659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.lastApplied = percent
                 self.lastError = nil
                 self.applyBackoff = .distantPast
-                self.monitorItem?.title = "Monitor: \(self.monitorName) (\(index))"
+                self.monitorItem?.title = "Monitor: \(self.displayLabel ?? self.monitorName) (\(index))"
             } else {
                 self.displayIndex = nil
                 self.lastApplied = nil
@@ -658,12 +678,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let index = displayIndex { return index }
         guard Date().timeIntervalSince(lastResolve) > 5 else { return nil }
         lastResolve = Date()
-        if let match = cache.entries.first(where: { $0.name.lowercased().contains(monitorName.lowercased()) }) {
-            displayIndex = match.index
+        if let entry = ddc.resolveDisplay(name: monitorName) {
+            displayIndex = entry.index
+            displayLabel = entry.name
+            updateMonitorItem()
             return displayIndex
         }
-        displayIndex = ddc.resolveIndex(name: monitorName)
-        return displayIndex
+        return nil
     }
 
     private func builtinDisplay() -> CGDirectDisplayID? {

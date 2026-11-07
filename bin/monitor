@@ -12,7 +12,7 @@ set -euo pipefail
 VERSION="1.1.0"
 
 M1DDC_BIN="${M1DDC_BIN:-m1ddc}"
-MONITOR_NAME="${MONITOR_NAME:-ARZOPA}"
+MONITOR_NAME="${MONITOR_NAME:-}"
 MONITOR_ID="${MONITOR_ID:-}"
 MIN=0
 MAX=100
@@ -77,11 +77,14 @@ resolve_display() {
   list="$(display_list)" || die "could not run '$M1DDC_BIN display list'"
   [ -n "$list" ] || die "no displays found"
 
-  id="$(printf '%s\n' "$list" | awk -v name="$MONITOR_NAME" '
-    index(tolower($0), tolower(name)) && match($0, /^\[[0-9]+\]/) {
-      print substr($0, 2, RLENGTH - 2)
-      exit
-    }')"
+  id=""
+  if [ -n "$MONITOR_NAME" ]; then
+    id="$(printf '%s\n' "$list" | awk -v name="$MONITOR_NAME" '
+      index(tolower($0), tolower(name)) && match($0, /^\[[0-9]+\]/) {
+        print substr($0, 2, RLENGTH - 2)
+        exit
+      }')"
+  fi
   if [ -n "$id" ]; then
     printf '%s\n' "$id"
     return 0
@@ -107,8 +110,13 @@ resolve_display() {
     return 1
   fi
 
-  printf 'monitor: no display named "%s".\n\nDisplays found:\n%s\n\nSet MONITOR_NAME or MONITOR_ID.\n' \
-    "$MONITOR_NAME" "$list" >&2
+  if [ -n "$MONITOR_NAME" ]; then
+    printf 'monitor: no display named "%s".\n\nDisplays found:\n%s\n\nSet MONITOR_NAME or MONITOR_ID.\n' \
+      "$MONITOR_NAME" "$list" >&2
+  else
+    printf 'monitor: more than one display answers DDC.\n\nDisplays found:\n%s\n\nSet MONITOR_ID to pick one.\n' \
+      "$list" >&2
+  fi
   return 1
 }
 
@@ -301,9 +309,13 @@ show_info() {
         if val="$(get_value "$id" "${feat%%:*}")"; then
           printf '%s: %s\n' "${feat##*:}" "$val"
         else
-          printf '%s: —\n' "${feat##*:}"
+          printf '%s: — (no DDC response)\n' "${feat##*:}"
         fi
       done
+    else
+      printf 'Brightness: — (no DDC response from any external display)\n'
+      printf 'Contrast:   —\n'
+      printf 'Volume:     —\n'
     fi
   fi
 }
@@ -336,7 +348,8 @@ Examples:
   monitor info      # displays, physical port, link and current values
 
 Environment:
-  MONITOR_NAME  monitor name in the m1ddc list (default: ARZOPA)
+  MONITOR_NAME  monitor name in the m1ddc list (default: first display that
+                answers DDC)
   MONITOR_ID    fixed display index, ignores MONITOR_NAME
   M1DDC_BIN     path to the m1ddc binary (default: m1ddc in PATH)
 

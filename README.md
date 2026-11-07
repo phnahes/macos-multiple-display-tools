@@ -126,7 +126,7 @@ if [ "$(brightness)" -lt 30 ]; then brightness 30; fi
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MONITOR_NAME` | `ARZOPA` | name fragment of the display in the m1ddc list |
+| `MONITOR_NAME` | — | name fragment of the display in the m1ddc list; when empty, the first display that answers DDC is used |
 | `MONITOR_ID` | — | fixed display index; ignores the name |
 | `M1DDC_BIN` | `m1ddc` in PATH | path to the m1ddc binary |
 | `MONITORBAR_DEBUG` | — | `1` makes the app log brightness and angle to stderr |
@@ -231,9 +231,10 @@ just prints `USB-C N`.
 
 ## Troubleshooting
 
-**`monitor: no display named "ARZOPA"`**
+**`monitor: no display named "X"` / `no external display answers DDC`**
 Run `monitor list` and adjust `MONITOR_NAME`, or pass the index:
-`MONITOR_ID=2 brightness 50`.
+`MONITOR_ID=2 brightness 50`. If nothing answers DDC, the problem is the cable,
+the adapter or the monitor OSD — see below.
 
 **The display disappears from the m1ddc list**
 Unplug and replug the cable. The index can change — MonitorBar re-resolves it

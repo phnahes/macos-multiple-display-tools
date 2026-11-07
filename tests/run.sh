@@ -41,6 +41,7 @@ check_contains() { # description needle haystack
 
 # --- brightness -------------------------------------------------------------
 check "default brightness" 50 "$("$MON" brightness)"
+check "auto-detect without a name" 50 "$(MONITOR_NAME='' "$MON" brightness)"
 check "set absolute" 70 "$("$MON" brightness 70)"
 check "state persisted" 70 "$(cat "$TMP/state/luminance")"
 check "increase by 5" 75 "$("$MON" brightness +5)"
